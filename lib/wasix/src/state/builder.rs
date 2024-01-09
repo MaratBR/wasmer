@@ -917,12 +917,12 @@ impl WasiEnvBuilder {
     }
 
     #[allow(clippy::result_large_err)]
-    pub fn run_with_store_ext(
+    pub fn prepare_wasi_env(
         self,
         module: Module,
         module_hash: ModuleHash,
         store: &mut Store,
-    ) -> Result<(), WasiRuntimeError> {
+    ) -> Result<PreparedWasiEnv, WasiRuntimeError> {
         // If no handle or runtime exists then create one
         #[cfg(feature = "sys-thread")]
         let _guard = if tokio::runtime::Handle::try_current().is_err() {
@@ -939,8 +939,8 @@ impl WasiEnvBuilder {
 
         if self.capabilites.threading.enable_asynchronous_threading {
             tracing::warn!(
-                "The enable_asynchronous_threading capability is enabled. Use WasiEnvBuilder::run_with_store_async() to avoid spurious errors.",
-            );
+                        "The enable_asynchronous_threading capability is enabled. Use WasiEnvBuilder::run_with_store_async() to avoid spurious errors.",
+                    );
         }
 
         let (instance, env) = self.instantiate_ext(module, module_hash, store)?;
@@ -955,25 +955,21 @@ impl WasiEnvBuilder {
                 .map_err(|exit| WasiRuntimeError::Wasi(WasiError::Exit(exit)))?;
         }
 
-        let start = instance.exports.get_function("_start")?;
-        env.data(&store).thread.set_status_running();
+        let prepared_env = PreparedWasiEnv::new(instance, env);
 
-        let result = crate::run_wasi_func_start(start, store);
-        let (result, exit_code) = super::wasi_exit_code(result);
+        Ok(prepared_env)
+    }
 
-        let pid = env.data(&store).pid();
-        let tid = env.data(&store).tid();
-        tracing::trace!(
-            %pid,
-            %tid,
-            %exit_code,
-            error=result.as_ref().err().map(|e| e as &dyn std::error::Error),
-            "main exit",
-        );
+    #[allow(clippy::result_large_err)]
+    pub fn run_with_store_ext(
+        self,
+        module: Module,
+        module_hash: ModuleHash,
+        store: &mut Store,
+    ) -> Result<(), WasiRuntimeError> {
+        let prepared_env = self.prepare_wasi_env(module, module_hash, store)?;
 
-        env.on_exit(store, Some(exit_code));
-
-        result
+        prepared_env.run(store)
     }
 
     /// Start the WASI executable with async threads enabled.
@@ -1106,6 +1102,43 @@ impl PreopenDirBuilder {
             write: self.write,
             create: self.create,
         })
+    }
+}
+
+pub struct PreparedWasiEnv {
+    instance: Instance,
+    env: WasiFunctionEnv,
+}
+
+impl PreparedWasiEnv {
+    pub fn new(instance: Instance, env: WasiFunctionEnv) -> Self {
+        Self { instance, env }
+    }
+
+    pub fn run(self, store: &mut Store) -> Result<(), WasiRuntimeError> {
+        let start = self.instance.exports.get_function("_start")?;
+        self.env.data(&store).thread.set_status_running();
+
+        let result = crate::run_wasi_func_start(start, store);
+        let (result, exit_code) = super::wasi_exit_code(result);
+
+        let pid = self.env.data(&store).pid();
+        let tid = self.env.data(&store).tid();
+        tracing::trace!(
+            %pid,
+            %tid,
+            %exit_code,
+            error=result.as_ref().err().map(|e| e as &dyn std::error::Error),
+            "main exit",
+        );
+
+        self.env.on_exit(store, Some(exit_code));
+
+        result
+    }
+
+    pub fn env(&self) -> &WasiFunctionEnv {
+        &self.env
     }
 }
 
